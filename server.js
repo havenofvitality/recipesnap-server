@@ -45,7 +45,7 @@ app.post('/api/import/url', async (req, res) => {
     const metaImage = imgMatch ? imgMatch[1] : null;
 
     const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 2000,
       messages: [
         {
@@ -85,7 +85,7 @@ app.post('/api/import/scan', async (req, res) => {
 
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 2000,
       messages: [
         {
@@ -132,7 +132,7 @@ app.post('/api/ai/fridge', async (req, res) => {
   if (!ingredients) return res.status(400).json({ error: 'ingredients is required' });
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1500,
       messages: [{
         role: 'user',
@@ -167,7 +167,7 @@ app.post('/api/ai/leftovers', async (req, res) => {
   if (!meal) return res.status(400).json({ error: 'meal is required' });
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 1500,
       messages: [{
         role: 'user',
@@ -204,7 +204,7 @@ app.post('/api/ai/chat', async (req, res) => {
   if (!message) return res.status(400).json({ error: 'message is required' });
   try {
     const response = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
+      model: 'claude-haiku-4-5-20251001',
       max_tokens: 800,
       system: 'You are an expert chef and cooking assistant. Answer cooking questions helpfully and concisely. Focus on practical advice.',
       messages: [{ role: 'user', content: message }],

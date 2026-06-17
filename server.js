@@ -216,6 +216,44 @@ app.post('/api/ai/chat', async (req, res) => {
   }
 });
 
+// AI Tool 4: Make it Healthier
+app.post('/api/ai/healthify', async (req, res) => {
+  const { ingredients, title } = req.body;
+  if (!ingredients) return res.status(400).json({ error: 'ingredients is required' });
+  try {
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 800,
+      messages: [{
+        role: 'user',
+        content: `Make this recipe healthier by suggesting ingredient substitutions.
+
+Recipe: ${title || 'Recipe'}
+Ingredients: ${ingredients}
+
+Return a JSON object with exactly this structure:
+{
+  "substitutions": [
+    { "original": string, "replacement": string, "reason": string }
+  ]
+}
+
+Suggest 3-5 meaningful substitutions that reduce calories, sugar, or saturated fat, or increase nutritional value. Only suggest substitutions that make practical sense for this recipe. Be specific.
+
+Return ONLY valid JSON. No markdown fences.`,
+      }],
+    });
+    const raw = response.content[0].text?.trim() ?? '';
+    let result;
+    try { result = JSON.parse(raw); }
+    catch { const m = raw.match(/\{[\s\S]+\}/); if (!m) return res.status(500).json({ error: 'Failed to parse AI response' }); result = JSON.parse(m[0]); }
+    res.json(result);
+  } catch (err) {
+    console.error('Healthify error:', err);
+    res.status(500).json({ error: 'AI request failed.' });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`\n✅ RecipeSnap server running on port ${PORT}`);

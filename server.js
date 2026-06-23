@@ -34,27 +34,12 @@ app.post('/api/import/url', async (req, res) => {
   try {
     let fetchUrl = url;
 
-    // For Pinterest: fetch the pin and extract the source URL
+    // Pinterest pins are bookmarks — they link to external recipe sites but block server access.
+    // Always ask the user to get the source URL directly.
     if (isPinterest) {
-      try {
-        const pinRes = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(10000) });
-        const pinHtml = await pinRes.text();
-        // Try to find the original source URL in the pin HTML
-        const sourceMatch =
-          pinHtml.match(/"url":"(https?:\/\/(?!www\.pinterest)[^"]+)"/) ||
-          pinHtml.match(/content="(https?:\/\/(?!www\.pinterest)[^"]+)"\s+property="og:see_also"/i);
-        if (sourceMatch) {
-          fetchUrl = sourceMatch[1];
-        } else {
-          return res.status(422).json({
-            error: 'Pinterest pins link to external recipe websites. Open the pin, tap the website link, and paste that URL instead.',
-          });
-        }
-      } catch {
-        return res.status(422).json({
-          error: 'Pinterest pins link to external recipe websites. Open the pin, tap the website link, and paste that URL instead.',
-        });
-      }
+      return res.status(422).json({
+        error: 'Pinterest pins link to external websites. Open the pin, tap the website link below the image, then paste THAT URL here.',
+      });
     }
 
     const pageRes = await fetch(fetchUrl, {

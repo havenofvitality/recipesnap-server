@@ -14,20 +14,59 @@ app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 // Extract recipe from URL (web or social)
 app.post('/api/import/url', async (req, res) => {
-  const { url } = req.body;
+  let { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
+  // Add https:// if missing
+  if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+
+  // Pinterest: extract source URL from pin and follow it
+  const isPinterest = /pinterest\.(com|fr|de|co\.uk)/i.test(url);
+
+  const BROWSER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Cache-Control': 'no-cache',
+  };
+
   try {
-    const pageRes = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; RecipeSnap/1.0; +https://recipesnap.app)',
-        Accept: 'text/html,application/xhtml+xml',
-      },
-      signal: AbortSignal.timeout(10000),
+    let fetchUrl = url;
+
+    // For Pinterest: fetch the pin and extract the source URL
+    if (isPinterest) {
+      try {
+        const pinRes = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(10000) });
+        const pinHtml = await pinRes.text();
+        // Try to find the original source URL in the pin HTML
+        const sourceMatch =
+          pinHtml.match(/"url":"(https?:\/\/(?!www\.pinterest)[^"]+)"/) ||
+          pinHtml.match(/content="(https?:\/\/(?!www\.pinterest)[^"]+)"\s+property="og:see_also"/i);
+        if (sourceMatch) {
+          fetchUrl = sourceMatch[1];
+        } else {
+          return res.status(422).json({
+            error: 'Pinterest pins link to external recipe websites. Open the pin, tap the website link, and paste that URL instead.',
+          });
+        }
+      } catch {
+        return res.status(422).json({
+          error: 'Pinterest pins link to external recipe websites. Open the pin, tap the website link, and paste that URL instead.',
+        });
+      }
+    }
+
+    const pageRes = await fetch(fetchUrl, {
+      headers: BROWSER_HEADERS,
+      signal: AbortSignal.timeout(12000),
     });
 
     if (!pageRes.ok) {
-      return res.status(422).json({ error: `Could not fetch page (HTTP ${pageRes.status})` });
+      if (pageRes.status === 403 || pageRes.status === 401) {
+        return res.status(422).json({ error: 'This website blocks automated access. Try copying the recipe text manually.' });
+      }
+      return res.status(422).json({ error: `Could not open this page (HTTP ${pageRes.status}). Check the URL and try again.` });
     }
 
     const html = await pageRes.text();
@@ -38,7 +77,11 @@ app.post('/api/import/url', async (req, res) => {
       .replace(/<[^>]+>/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 10000);
+      .slice(0, 12000);
+
+    if (text.length < 200) {
+      return res.status(422).json({ error: 'This page requires a browser to load (JavaScript-only site). Try a different recipe URL.' });
+    }
 
     const imgMatch = html.match(/property="og:image"\s+content="([^"]+)"/i)
       || html.match(/content="([^"]+)"\s+property="og:image"/i);
@@ -61,7 +104,7 @@ app.post('/api/import/url', async (req, res) => {
       recipe = JSON.parse(raw);
     } catch {
       const jsonMatch = raw.match(/\{[\s\S]+\}/);
-      if (!jsonMatch) return res.status(500).json({ error: 'Failed to parse AI response' });
+      if (!jsonMatch) return res.status(500).json({ error: 'Could not read the AI response. Please try again.' });
       recipe = JSON.parse(jsonMatch[0]);
     }
 
@@ -72,9 +115,9 @@ app.post('/api/import/url', async (req, res) => {
   } catch (err) {
     console.error('URL import error:', err);
     if (err.name === 'TimeoutError' || err.name === 'AbortError') {
-      return res.status(422).json({ error: 'Page took too long to load' });
+      return res.status(422).json({ error: 'The page took too long to load. Try again or use a different URL.' });
     }
-    res.status(500).json({ error: 'Failed to extract recipe. Check server logs.' });
+    res.status(500).json({ error: `Import failed: ${err.message || 'Unknown error'}` });
   }
 });
 

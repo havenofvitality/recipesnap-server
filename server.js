@@ -20,8 +20,9 @@ app.post('/api/import/url', async (req, res) => {
   // Add https:// if missing
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
 
-  // Pinterest: extract source URL from pin and follow it
-  const isPinterest = /pinterest\.(com|fr|de|co\.uk)/i.test(url);
+  // Detect platforms
+  const isPinterest = /pinterest\.(com|fr|de|co\.uk|ca|com\.au)|pin\.it/i.test(url);
+  const isYouTube = /youtube\.com|youtu\.be/i.test(url);
 
   const BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
@@ -34,12 +35,74 @@ app.post('/api/import/url', async (req, res) => {
   try {
     let fetchUrl = url;
 
-    // Pinterest pins are bookmarks — they link to external recipe sites but block server access.
-    // Always ask the user to get the source URL directly.
+    // Pinterest: fetch the pin page and extract the source URL from their JSON data
     if (isPinterest) {
-      return res.status(422).json({
-        error: 'Pinterest pins link to external websites. Open the pin, tap the website link below the image, then paste THAT URL here.',
-      });
+      try {
+        const pinRes = await fetch(url, {
+          headers: BROWSER_HEADERS,
+          redirect: 'follow',
+          signal: AbortSignal.timeout(12000),
+        });
+        const pinHtml = await pinRes.text();
+
+        // Pinterest stores the external recipe URL in "link":"..." inside their embedded JSON
+        // The URL may contain unicode-escaped slashes (/ = /)
+        let sourceUrl = null;
+        const candidates = [
+          ...pinHtml.matchAll(/"link":"(https?:[^"\\]*(?:\\.[^"\\]*)*)"/g),
+          ...pinHtml.matchAll(/property="og:see_also"\s+content="([^"]+)"/gi),
+          ...pinHtml.matchAll(/content="([^"]+)"\s+property="og:see_also"/gi),
+        ];
+
+        for (const match of candidates) {
+          const decoded = match[1]
+            .replace(/\\u002F/gi, '/')
+            .replace(/\\u003A/gi, ':')
+            .replace(/\\\//g, '/')
+            .trim();
+          if (decoded.startsWith('http') && !/pinterest\./i.test(decoded)) {
+            sourceUrl = decoded;
+            break;
+          }
+        }
+
+        if (sourceUrl) {
+          fetchUrl = sourceUrl;
+        } else {
+          return res.status(422).json({
+            error: 'This Pinterest pin has no external recipe link. Open the pin on Pinterest, tap the website link below the image, and paste that URL here.',
+          });
+        }
+      } catch (err) {
+        return res.status(422).json({
+          error: 'Could not read this Pinterest pin. Try pasting the recipe website URL directly.',
+        });
+      }
+    }
+
+    // YouTube: extract from video description (often contains full recipe)
+    if (isYouTube) {
+      try {
+        const ytRes = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(12000) });
+        const ytHtml = await ytRes.text();
+        const descMatch = ytHtml.match(/"description":\{"runs":\[\{"text":"([\s\S]{100,5000}?)"\}/);
+        if (descMatch) {
+          const desc = descMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
+          const ytPrompt = `Extract the recipe from this YouTube video description. Return JSON:\n{\n  "title": string,\n  "servings": number,\n  "time": string or null,\n  "ingredients": [{"qty": string, "name": string}],\n  "instructions": [string]\n}\nIf no recipe found: {"error": "No recipe in description"}\n\nDescription:\n${desc.slice(0, 6000)}\n\nReturn ONLY valid JSON.`;
+          const ytResp = await anthropic.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 2000, messages: [{ role: 'user', content: ytPrompt }] });
+          const raw = ytResp.content[0].text?.trim() ?? '';
+          let recipe;
+          try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); if (!m) return res.status(500).json({ error: 'Could not parse AI response.' }); recipe = JSON.parse(m[0]); }
+          if (!recipe.error) {
+            const imgM = ytHtml.match(/"thumbnailUrl":"([^"]+)"/);
+            if (imgM && !recipe.imageUrl) recipe.imageUrl = imgM[1];
+            return res.json(recipe);
+          }
+        }
+        return res.status(422).json({ error: 'No recipe found in this YouTube video description. The creator may not have included one.' });
+      } catch {
+        return res.status(422).json({ error: 'Could not read this YouTube video. Try again.' });
+      }
     }
 
     const pageRes = await fetch(fetchUrl, {

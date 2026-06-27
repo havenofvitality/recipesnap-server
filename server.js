@@ -22,7 +22,10 @@ app.post('/api/import/url', async (req, res) => {
 
   // Detect platforms
   const isPinterest = /pinterest\.(com|fr|de|co\.uk|ca|com\.au)|pin\.it/i.test(url);
-  const isYouTube = /youtube\.com|youtu\.be/i.test(url);
+  const isYouTube   = /youtube\.com|youtu\.be/i.test(url);
+  const isInstagram = /instagram\.com\/(p|reel|tv)\//i.test(url);
+  const isTikTok    = /tiktok\.com/i.test(url);
+  const isFacebook  = /facebook\.com\/(?!groups|events)|fb\.watch|fb\.com/i.test(url);
 
   const BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
@@ -77,6 +80,86 @@ app.post('/api/import/url', async (req, res) => {
         return res.status(422).json({
           error: 'Could not read this Pinterest pin. Try pasting the recipe website URL directly.',
         });
+      }
+    }
+
+    // Instagram: use public embed endpoint to get caption (no login needed for public posts)
+    if (isInstagram) {
+      const match = url.match(/instagram\.com\/(?:p|reel|tv)\/([A-Za-z0-9_-]+)/);
+      if (!match) return res.status(422).json({ error: 'Invalid Instagram URL. Copy the link directly from the post.' });
+      const code = match[1];
+      try {
+        const embedRes = await fetch(`https://www.instagram.com/p/${code}/embed/captioned/`, {
+          headers: BROWSER_HEADERS,
+          signal: AbortSignal.timeout(12000),
+        });
+        const embedHtml = await embedRes.text();
+        const embedText = embedHtml
+          .replace(/<script[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[\s\S]*?<\/style>/gi, '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ').trim().slice(0, 8000);
+        if (embedText.length < 100) {
+          return res.status(422).json({ error: 'Could not read this Instagram post. Make sure the account is public.' });
+        }
+        const igResp = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
+          messages: [{ role: 'user', content: `Extract the recipe from this Instagram post caption.\nReturn JSON: {"title":string,"servings":number,"time":string|null,"ingredients":[{"qty":string,"name":string}],"instructions":[string]}\nIf no recipe: {"error":"No recipe in this post"}\n\nPost:\n${embedText}\n\nReturn ONLY valid JSON.` }],
+        });
+        const raw = igResp.content[0].text?.trim() ?? '';
+        let recipe; try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); if (!m) return res.status(500).json({ error: 'Could not parse response.' }); recipe = JSON.parse(m[0]); }
+        if (recipe.error) return res.status(422).json({ error: recipe.error });
+        return res.json(recipe);
+      } catch {
+        return res.status(422).json({ error: 'Could not read this Instagram post. Make sure the post is public.' });
+      }
+    }
+
+    // TikTok: use official oEmbed API (free, no auth needed)
+    if (isTikTok) {
+      try {
+        const oRes = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, {
+          headers: BROWSER_HEADERS, signal: AbortSignal.timeout(10000),
+        });
+        const oData = await oRes.json();
+        const caption = oData.title || '';
+        if (caption.length < 20) return res.status(422).json({ error: 'This TikTok has no recipe in the caption. The creator may have put the recipe in a comment.' });
+        const ttResp = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
+          messages: [{ role: 'user', content: `Extract the recipe from this TikTok caption.\nReturn JSON: {"title":string,"servings":number,"time":string|null,"ingredients":[{"qty":string,"name":string}],"instructions":[string]}\nIf no recipe: {"error":"No recipe in this TikTok"}\n\nCaption:\n${caption}\n\nReturn ONLY valid JSON.` }],
+        });
+        const raw = ttResp.content[0].text?.trim() ?? '';
+        let recipe; try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); if (!m) return res.status(500).json({ error: 'Could not parse response.' }); recipe = JSON.parse(m[0]); }
+        if (recipe.error) return res.status(422).json({ error: recipe.error });
+        if (oData.thumbnail_url && !recipe.imageUrl) recipe.imageUrl = oData.thumbnail_url;
+        return res.json(recipe);
+      } catch {
+        return res.status(422).json({ error: 'Could not read this TikTok. Make sure the video is public.' });
+      }
+    }
+
+    // Facebook: use public post embed
+    if (isFacebook) {
+      try {
+        const fbEmbed = `https://www.facebook.com/plugins/post.php?href=${encodeURIComponent(url)}&width=500`;
+        const fbRes = await fetch(fbEmbed, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(12000) });
+        const fbHtml = await fbRes.text();
+        const fbText = fbHtml
+          .replace(/<script[\s\S]*?<\/script>/gi, '')
+          .replace(/<style[\s\S]*?<\/style>/gi, '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ').trim().slice(0, 8000);
+        if (fbText.length < 100) return res.status(422).json({ error: 'Could not read this Facebook post. Make sure it is public.' });
+        const fbResp = await anthropic.messages.create({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
+          messages: [{ role: 'user', content: `Extract the recipe from this Facebook post.\nReturn JSON: {"title":string,"servings":number,"time":string|null,"ingredients":[{"qty":string,"name":string}],"instructions":[string]}\nIf no recipe: {"error":"No recipe in this post"}\n\nPost:\n${fbText}\n\nReturn ONLY valid JSON.` }],
+        });
+        const raw = fbResp.content[0].text?.trim() ?? '';
+        let recipe; try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); if (!m) return res.status(500).json({ error: 'Could not parse response.' }); recipe = JSON.parse(m[0]); }
+        if (recipe.error) return res.status(422).json({ error: recipe.error });
+        return res.json(recipe);
+      } catch {
+        return res.status(422).json({ error: 'Could not read this Facebook post. Make sure it is a public post.' });
       }
     }
 

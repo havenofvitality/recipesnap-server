@@ -44,7 +44,7 @@ app.post('/api/import/url', async (req, res) => {
         const pinRes = await fetch(url, {
           headers: BROWSER_HEADERS,
           redirect: 'follow',
-          signal: AbortSignal.timeout(12000),
+          signal: AbortSignal.timeout(20000),
         });
         const pinHtml = await pinRes.text();
 
@@ -163,34 +163,55 @@ app.post('/api/import/url', async (req, res) => {
       }
     }
 
-    // YouTube: extract from video description (often contains full recipe)
+    // YouTube: read the description (shortDescription field is reliable).
+    // 1) try to extract a full recipe from the description text
+    // 2) if none, follow a recipe-blog link found in the description
     if (isYouTube) {
       try {
-        const ytRes = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(12000) });
+        const ytRes = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(20000) });
         const ytHtml = await ytRes.text();
-        const descMatch = ytHtml.match(/"description":\{"runs":\[\{"text":"([\s\S]{100,5000}?)"\}/);
+        const descMatch = ytHtml.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
+        let desc = '';
         if (descMatch) {
-          const desc = descMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
-          const ytPrompt = `Extract the recipe from this YouTube video description. Return JSON:\n{\n  "title": string,\n  "servings": number,\n  "time": string or null,\n  "ingredients": [{"qty": string, "name": string}],\n  "instructions": [string]\n}\nIf no recipe found: {"error": "No recipe in description"}\n\nDescription:\n${desc.slice(0, 6000)}\n\nReturn ONLY valid JSON.`;
+          desc = descMatch[1]
+            .replace(/\\n/g, '\n').replace(/\\r/g, '')
+            .replace(/\\"/g, '"').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+        }
+
+        const ytImg = ytHtml.match(/"thumbnailUrl":"([^"]+)"/);
+        const thumb = ytImg ? ytImg[1].replace(/\\\//g, '/') : null;
+
+        // 1) Recipe written directly in the description?
+        if (desc.length > 80) {
+          const ytPrompt = `Extract the recipe from this YouTube video description. Return JSON:\n{\n  "title": string,\n  "servings": number,\n  "time": string or null,\n  "ingredients": [{"qty": string, "name": string}],\n  "instructions": [string]\n}\nOnly succeed if the description actually contains a list of ingredients AND steps. If it just links elsewhere or has no real recipe, return {"error": "no inline recipe"}\n\nDescription:\n${desc.slice(0, 6000)}\n\nReturn ONLY valid JSON.`;
           const ytResp = await anthropic.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 2000, messages: [{ role: 'user', content: ytPrompt }] });
           const raw = ytResp.content[0].text?.trim() ?? '';
           let recipe;
-          try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); if (!m) return res.status(500).json({ error: 'Could not parse AI response.' }); recipe = JSON.parse(m[0]); }
+          try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); recipe = m ? JSON.parse(m[0]) : { error: 'parse' }; }
           if (!recipe.error) {
-            const imgM = ytHtml.match(/"thumbnailUrl":"([^"]+)"/);
-            if (imgM && !recipe.imageUrl) recipe.imageUrl = imgM[1];
+            if (thumb && !recipe.imageUrl) recipe.imageUrl = thumb;
             return res.json(recipe);
           }
         }
-        return res.status(422).json({ error: 'No recipe found in this YouTube video description. The creator may not have included one.' });
+
+        // 2) No inline recipe — find a recipe website link in the description and follow it
+        const urls = desc.match(/https?:\/\/[^\s"'<>]+/g) || [];
+        const blogUrl = urls.find((u) =>
+          !/youtu\.?be|youtube\.com|google\.|amazon\.|instagram\.|tiktok\.|facebook\.|patreon\.|paypal\.|venmo\.|bit\.ly|linktr\.ee|twitter\.|x\.com|spotify\./i.test(u)
+        );
+        if (blogUrl) {
+          fetchUrl = blogUrl.replace(/[).,]+$/, ''); // strip trailing punctuation, fall through to web extraction below
+        } else {
+          return res.status(422).json({ error: 'No recipe found for this video. The recipe is likely shown in the video itself, not written in the description.' });
+        }
       } catch {
-        return res.status(422).json({ error: 'Could not read this YouTube video. Try again.' });
+        return res.status(422).json({ error: 'Could not read this YouTube video. The server may be waking up — try again in 30 seconds.' });
       }
     }
 
     const pageRes = await fetch(fetchUrl, {
       headers: BROWSER_HEADERS,
-      signal: AbortSignal.timeout(12000),
+      signal: AbortSignal.timeout(20000),
     });
 
     if (!pageRes.ok) {

@@ -1,13 +1,36 @@
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const Anthropic = require('@anthropic-ai/sdk');
 require('dotenv').config();
 
 const app = express();
+
+// Render runs the app behind a reverse proxy. Trust the first proxy hop so
+// rate limiting keys on the real client IP (not Render's shared proxy IP).
+app.set('trust proxy', 1);
+
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ── Rate limiting (anti-abuse / anti-cost-blowup) ──────────────
+// The AI + import endpoints each call Anthropic and cost money, so they are
+// capped tightly. /health is intentionally NOT limited (cron keep-alive pings).
+const jsonMessage = (msg) => ({
+  windowMs: 60 * 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: msg },
+});
+
+const generalLimiter = rateLimit({ ...jsonMessage('Too many requests. Please slow down and try again in a minute.'), max: 60 });
+const aiLimiter = rateLimit({ ...jsonMessage('You are sending requests too quickly. Please wait a minute and try again.'), max: 12 });
+
+app.use('/api/', generalLimiter);        // safety net on every API route
+app.use('/api/ai/', aiLimiter);          // stricter: Smart Chef (fridge/leftovers/chat/healthify)
+app.use('/api/import/', aiLimiter);      // stricter: URL + scan extraction (also call Anthropic)
 
 // Health check
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));

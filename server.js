@@ -229,25 +229,48 @@ app.post('/api/import/url', async (req, res) => {
         let desc = '';
         let thumb = null;
 
-        // 1st source: YouTube's own player API (works from datacenter IPs where
-        // the watch page serves a consent wall / different HTML instead).
         const idMatch = url.match(/(?:youtube\.com\/(?:watch\?[^#]*?v=|shorts\/|live\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i);
-        if (idMatch) {
+
+        // 1st source: official YouTube Data API — the ONLY method YouTube
+        // guarantees from datacenter IPs (Render). Needs YOUTUBE_API_KEY env var.
+        if (idMatch && process.env.YOUTUBE_API_KEY) {
           try {
-            const pRes = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                videoId: idMatch[1],
-                context: { client: { clientName: 'WEB', clientVersion: '2.20240726.00.00', hl: 'en' } },
-              }),
-              signal: AbortSignal.timeout(15000),
-            });
-            const pData = await pRes.json();
-            desc = pData?.videoDetails?.shortDescription || '';
-            const thumbs = pData?.videoDetails?.thumbnail?.thumbnails;
-            if (Array.isArray(thumbs) && thumbs.length) thumb = thumbs[thumbs.length - 1].url;
-          } catch { /* fall through to HTML scrape below */ }
+            const aRes = await fetch(
+              `https://www.googleapis.com/youtube/v3/videos?part=snippet&id=${idMatch[1]}&key=${process.env.YOUTUBE_API_KEY}`,
+              { signal: AbortSignal.timeout(12000) }
+            );
+            const aData = await aRes.json();
+            const sn = aData?.items?.[0]?.snippet;
+            if (sn) {
+              desc = sn.description || '';
+              const t = sn.thumbnails;
+              thumb = (t?.maxres || t?.high || t?.medium || t?.default)?.url || null;
+            }
+          } catch { /* fall through */ }
+        }
+
+        // 2nd source: YouTube's internal player API (works from residential IPs;
+        // datacenter IPs are often blocked — try two client profiles).
+        if (idMatch && !desc) {
+          const clients = [
+            { clientName: 'WEB', clientVersion: '2.20240726.00.00', hl: 'en' },
+            { clientName: 'IOS', clientVersion: '19.45.4', deviceMake: 'Apple', deviceModel: 'iPhone16,2', osName: 'iPhone', osVersion: '18.1.0.22B83', hl: 'en' },
+          ];
+          for (const client of clients) {
+            try {
+              const pRes = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ videoId: idMatch[1], context: { client } }),
+                signal: AbortSignal.timeout(15000),
+              });
+              const pData = await pRes.json();
+              desc = pData?.videoDetails?.shortDescription || '';
+              const thumbs = pData?.videoDetails?.thumbnail?.thumbnails;
+              if (!thumb && Array.isArray(thumbs) && thumbs.length) thumb = thumbs[thumbs.length - 1].url;
+              if (desc) break;
+            } catch { /* try next client */ }
+          }
         }
 
         // 2nd source (fallback): scrape the watch page HTML

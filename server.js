@@ -40,8 +40,24 @@ app.post('/api/import/url', async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
+  // Repair typos mobile keyboards inject into pasted links:
+  // "www domain.com" (space instead of dot), "site . com", or a URL buried in shared text.
+  url = String(url).trim().replace(/^((?:https?:\/\/)?www)\s+/i, '$1.');
+  const embedded = url.match(/https?:\/\/\S+/i);
+  if (embedded) {
+    url = embedded[0];
+  } else {
+    url = url.replace(/\s*\.\s*/g, '.');
+    url = url.split(/\s+/).find((p) => p.includes('.')) || url;
+  }
+
   // Add https:// if missing
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+
+  // Validate before fetching so the user gets a clear message, not a raw parse error
+  try { new URL(url); } catch {
+    return res.status(422).json({ error: 'This link looks invalid. Copy the URL again from your browser or the app, then paste it here.' });
+  }
 
   // Detect platforms
   const isPinterest = /pinterest\.(com|fr|de|co\.uk|ca|com\.au)|pin\.it/i.test(url);
@@ -141,11 +157,30 @@ app.post('/api/import/url', async (req, res) => {
     // TikTok: use official oEmbed API (free, no auth needed)
     if (isTikTok) {
       try {
-        const oRes = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, {
-          headers: BROWSER_HEADERS, signal: AbortSignal.timeout(10000),
-        });
-        const oData = await oRes.json();
-        const caption = oData.title || '';
+        let caption = '';
+        let oData = {};
+        try {
+          const oRes = await fetch(`https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`, {
+            headers: BROWSER_HEADERS, signal: AbortSignal.timeout(10000),
+          });
+          oData = await oRes.json();
+          caption = oData.title || '';
+        } catch { /* fall through to page scrape */ }
+
+        // Fallback: read the video page itself and pull the description from its JSON
+        if (caption.length < 20) {
+          try {
+            const tRes = await fetch(url, { headers: BROWSER_HEADERS, redirect: 'follow', signal: AbortSignal.timeout(15000) });
+            const tHtml = await tRes.text();
+            const dMatch = tHtml.match(/"desc":"((?:[^"\\]|\\.)*)"/);
+            if (dMatch) {
+              const pageDesc = dMatch[1]
+                .replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+              if (pageDesc.length > caption.length) caption = pageDesc;
+            }
+          } catch { /* keep whatever oEmbed gave us */ }
+        }
+
         if (caption.length < 20) return res.status(422).json({ error: 'This TikTok has no recipe in the caption. The creator may have put the recipe in a comment.' });
         const ttResp = await anthropic.messages.create({
           model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
@@ -191,18 +226,45 @@ app.post('/api/import/url', async (req, res) => {
     // 2) if none, follow a recipe-blog link found in the description
     if (isYouTube) {
       try {
-        const ytRes = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(20000) });
-        const ytHtml = await ytRes.text();
-        const descMatch = ytHtml.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
         let desc = '';
-        if (descMatch) {
-          desc = descMatch[1]
-            .replace(/\\n/g, '\n').replace(/\\r/g, '')
-            .replace(/\\"/g, '"').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+        let thumb = null;
+
+        // 1st source: YouTube's own player API (works from datacenter IPs where
+        // the watch page serves a consent wall / different HTML instead).
+        const idMatch = url.match(/(?:youtube\.com\/(?:watch\?[^#]*?v=|shorts\/|live\/|embed\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i);
+        if (idMatch) {
+          try {
+            const pRes = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                videoId: idMatch[1],
+                context: { client: { clientName: 'WEB', clientVersion: '2.20240726.00.00', hl: 'en' } },
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            const pData = await pRes.json();
+            desc = pData?.videoDetails?.shortDescription || '';
+            const thumbs = pData?.videoDetails?.thumbnail?.thumbnails;
+            if (Array.isArray(thumbs) && thumbs.length) thumb = thumbs[thumbs.length - 1].url;
+          } catch { /* fall through to HTML scrape below */ }
         }
 
-        const ytImg = ytHtml.match(/"thumbnailUrl":"([^"]+)"/);
-        const thumb = ytImg ? ytImg[1].replace(/\\\//g, '/') : null;
+        // 2nd source (fallback): scrape the watch page HTML
+        if (!desc) {
+          const ytRes = await fetch(url, { headers: BROWSER_HEADERS, signal: AbortSignal.timeout(20000) });
+          const ytHtml = await ytRes.text();
+          const descMatch = ytHtml.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/);
+          if (descMatch) {
+            desc = descMatch[1]
+              .replace(/\\n/g, '\n').replace(/\\r/g, '')
+              .replace(/\\"/g, '"').replace(/\\u0026/g, '&').replace(/\\\//g, '/');
+          }
+          if (!thumb) {
+            const ytImg = ytHtml.match(/"thumbnailUrl":"([^"]+)"/);
+            thumb = ytImg ? ytImg[1].replace(/\\\//g, '/') : null;
+          }
+        }
 
         // 1) Recipe written directly in the description?
         if (desc.length > 80) {

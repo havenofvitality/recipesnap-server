@@ -291,16 +291,16 @@ app.post('/api/import/url', async (req, res) => {
 
         // 1) Recipe written directly in the description?
         if (desc.length > 80) {
-          const ytPrompt = `Extract the recipe from this YouTube video description. Return JSON:\n{\n  "title": string,\n  "servings": number,\n  "time": string or null,\n  "ingredients": [{"qty": string, "name": string}],\n  "instructions": [string]\n}\nSucceed if the description contains at least a list of ingredients — many creators list ONLY ingredients and show the steps in the video. Extract the preparation steps if present; if steps are missing, return "instructions": []. Only return {"error": "no inline recipe"} if there is no ingredient list at all.\n\nDescription:\n${desc.slice(0, 6000)}\n\nReturn ONLY valid JSON.`;
+          const ytPrompt = `Extract the recipe from this YouTube video description. Return JSON:\n{\n  "title": string,\n  "servings": number,\n  "time": string or null,\n  "ingredients": [{"qty": string, "name": string}],\n  "instructions": [string]\n}\nSucceed if the description contains at least a list of ingredients — many creators list ONLY ingredients and demonstrate the steps in the video.\n- If the description already contains preparation steps, extract them verbatim.\n- If the description has ingredients but NO written steps, WRITE clear, concise step-by-step instructions yourself based on the dish title and the ingredient list (use standard cooking technique for this dish). Produce a genuinely usable method (5-10 steps).\n- Never return an empty "instructions" array.\nOnly return {"error": "no inline recipe"} if there is no ingredient list at all.\n\nDescription:\n${desc.slice(0, 6000)}\n\nReturn ONLY valid JSON.`;
           const ytResp = await anthropic.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 2000, messages: [{ role: 'user', content: ytPrompt }] });
           const raw = ytResp.content[0].text?.trim() ?? '';
           let recipe;
           try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); recipe = m ? JSON.parse(m[0]) : { error: 'parse' }; }
           if (!recipe.error) {
             if (thumb && !recipe.imageUrl) recipe.imageUrl = thumb;
-            // Many creators list only ingredients — the steps live in the video itself.
+            // Safety net: if the model still returned no steps, give a usable fallback.
             if (!Array.isArray(recipe.instructions) || recipe.instructions.length === 0) {
-              recipe.instructions = ['Watch the original video for the step-by-step method — the full ingredient list is saved here.'];
+              recipe.instructions = ['Combine and prepare the ingredients above following standard method for this dish. Watch the original video for the exact technique.'];
             }
             return res.json(recipe);
           }

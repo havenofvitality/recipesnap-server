@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const Anthropic = require('@anthropic-ai/sdk');
+const { AsyncLocalStorage } = require('node:async_hooks');
 require('dotenv').config();
 
 const app = express();
@@ -13,7 +14,140 @@ app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
 
+// ── Per-request language context ──────────────────────────────
+// The app sends the user's chosen language in the X-App-Language header. We
+// keep it in AsyncLocalStorage rather than a module variable so concurrent
+// requests never read each other's language.
+const reqCtx = new AsyncLocalStorage();
+app.use((req, _res, next) => {
+  const raw = String(req.headers['x-app-language'] ?? '').toLowerCase().slice(0, 2);
+  reqCtx.run({ lang: raw || 'en' }, next);
+});
+
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ── AI provider: Gemini Flash first (free tier), Anthropic Haiku as fallback ──
+// Every AI call in this file goes through `ai.messages.create()`, which is a
+// drop-in replacement for `anthropic.messages.create()` (same options in, same
+// { content: [{ text }] } out). It tries Gemini Flash — which is free — and
+// silently falls back to Haiku (paid) whenever Gemini is missing, rate-limited
+// or errors, so the app never breaks. Set GEMINI_API_KEY to enable Gemini.
+const GEMINI_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
+// Translate Anthropic-style messages (text blocks + base64 image blocks, as
+// used by /api/import/scan) into Gemini's "parts" format.
+function toGeminiParts(messages) {
+  const parts = [];
+  for (const m of messages ?? []) {
+    const c = m.content;
+    if (typeof c === 'string') { parts.push({ text: c }); continue; }
+    for (const block of c ?? []) {
+      if (block.type === 'text') {
+        parts.push({ text: block.text });
+      } else if (block.type === 'image' && block.source?.data) {
+        parts.push({
+          inline_data: {
+            mime_type: block.source.media_type || 'image/jpeg',
+            data: block.source.data,
+          },
+        });
+      }
+    }
+  }
+  return parts;
+}
+
+async function callGemini(opts) {
+  const parts = toGeminiParts(opts.messages);
+  if (!parts.length) throw new Error('no content to send');
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        generationConfig: { maxOutputTokens: opts.max_tokens ?? 2000 },
+      }),
+      signal: AbortSignal.timeout(30000),
+    }
+  );
+  if (!res.ok) throw new Error(`Gemini HTTP ${res.status}`);
+  const data = await res.json();
+  const text = (data?.candidates?.[0]?.content?.parts ?? [])
+    .map((p) => p.text ?? '')
+    .join('')
+    .trim();
+  if (!text) throw new Error('Gemini returned empty text');
+  return text;
+}
+
+// ── Language + measurement system ─────────────────────────────
+// Recipes used to come back in whatever language the source page was written
+// in (almost always English) with US units, no matter what language the user
+// had picked in the app. These helpers force every model answer into the
+// user's language and the right measurement system.
+// English targets the US audience → US customary. Every other shipped
+// language (de/es/fr) is a metric market.
+const LANGUAGE_NAMES = { en: 'English', de: 'German', es: 'Spanish', fr: 'French' };
+
+function langDirective(lang) {
+  const code = LANGUAGE_NAMES[lang] ? lang : 'en';
+  const name = LANGUAGE_NAMES[code];
+  const units = code === 'en'
+    ? 'US customary units (cups, tablespoons, teaspoons, ounces, pounds, °F)'
+    : 'metric units (grams, millilitres, litres, °C)';
+  return `
+
+LANGUAGE AND UNITS — MANDATORY:
+- Write every piece of text you output in ${name}, even when the source material is in another language: translate the title, every ingredient name and every instruction step.
+- Express every quantity and temperature in ${units}. Convert from the source when needed and round to amounts a cook would actually use.
+- JSON field names stay exactly as specified above, in English. Only the VALUES are written in ${name}.`;
+}
+
+// Append the directive to the last user message. Content is a plain string for
+// text prompts and an array of blocks when an image is attached (recipe scan),
+// so both shapes are handled.
+function withLangDirective(opts, lang) {
+  const directive = langDirective(lang);
+  const messages = (opts.messages ?? []).map((m, i, arr) => {
+    if (i !== arr.length - 1 || m.role !== 'user') return m;
+
+    if (typeof m.content === 'string') {
+      return { ...m, content: m.content + directive };
+    }
+    if (Array.isArray(m.content)) {
+      const content = [...m.content];
+      for (let j = content.length - 1; j >= 0; j--) {
+        if (content[j]?.type === 'text') {
+          content[j] = { ...content[j], text: content[j].text + directive };
+          return { ...m, content };
+        }
+      }
+      content.push({ type: 'text', text: directive });
+      return { ...m, content };
+    }
+    return m;
+  });
+  return { ...opts, messages };
+}
+
+const ai = {
+  messages: {
+    create: async (rawOpts) => {
+      const opts = withLangDirective(rawOpts, reqCtx.getStore()?.lang ?? 'en');
+      if (GEMINI_KEY) {
+        try {
+          return { content: [{ text: await callGemini(opts) }] };
+        } catch (e) {
+          console.warn('[AI] Gemini unavailable → falling back to Haiku:', e.message);
+        }
+      }
+      return anthropic.messages.create(opts);
+    },
+  },
+};
 
 // ── Rate limiting (anti-abuse / anti-cost-blowup) ──────────────
 // The AI + import endpoints each call Anthropic and cost money, so they are
@@ -141,7 +275,7 @@ app.post('/api/import/url', async (req, res) => {
         if (embedText.length < 100) {
           return res.status(422).json({ error: 'Could not read this Instagram post. Make sure the account is public.' });
         }
-        const igResp = await anthropic.messages.create({
+        const igResp = await ai.messages.create({
           model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
           messages: [{ role: 'user', content: `Extract the recipe from this Instagram post caption.\nReturn JSON: {"title":string,"servings":number,"time":string|null,"ingredients":[{"qty":string,"name":string}],"instructions":[string]}\nIf no recipe: {"error":"No recipe in this post"}\n\nPost:\n${embedText}\n\nReturn ONLY valid JSON.` }],
         });
@@ -182,7 +316,7 @@ app.post('/api/import/url', async (req, res) => {
         }
 
         if (caption.length < 20) return res.status(422).json({ error: 'This TikTok has no recipe in the caption. The creator may have put the recipe in a comment.' });
-        const ttResp = await anthropic.messages.create({
+        const ttResp = await ai.messages.create({
           model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
           messages: [{ role: 'user', content: `Extract the recipe from this TikTok caption.\nReturn JSON: {"title":string,"servings":number,"time":string|null,"ingredients":[{"qty":string,"name":string}],"instructions":[string]}\nIf no recipe: {"error":"No recipe in this TikTok"}\n\nCaption:\n${caption}\n\nReturn ONLY valid JSON.` }],
         });
@@ -208,7 +342,7 @@ app.post('/api/import/url', async (req, res) => {
           .replace(/<[^>]+>/g, ' ')
           .replace(/\s+/g, ' ').trim().slice(0, 8000);
         if (fbText.length < 100) return res.status(422).json({ error: 'Could not read this Facebook post. Make sure it is public.' });
-        const fbResp = await anthropic.messages.create({
+        const fbResp = await ai.messages.create({
           model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
           messages: [{ role: 'user', content: `Extract the recipe from this Facebook post.\nReturn JSON: {"title":string,"servings":number,"time":string|null,"ingredients":[{"qty":string,"name":string}],"instructions":[string]}\nIf no recipe: {"error":"No recipe in this post"}\n\nPost:\n${fbText}\n\nReturn ONLY valid JSON.` }],
         });
@@ -292,7 +426,7 @@ app.post('/api/import/url', async (req, res) => {
         // 1) Recipe written directly in the description?
         if (desc.length > 80) {
           const ytPrompt = `Extract the recipe from this YouTube video description. Return JSON:\n{\n  "title": string,\n  "servings": number,\n  "time": string or null,\n  "ingredients": [{"qty": string, "name": string}],\n  "instructions": [string]\n}\nSucceed if the description contains at least a list of ingredients — many creators list ONLY ingredients and demonstrate the steps in the video.\n- If the description already contains preparation steps, extract them verbatim.\n- If the description has ingredients but NO written steps, WRITE clear, concise step-by-step instructions yourself based on the dish title and the ingredient list (use standard cooking technique for this dish). Produce a genuinely usable method (5-10 steps).\n- Never return an empty "instructions" array.\nOnly return {"error": "no inline recipe"} if there is no ingredient list at all.\n\nDescription:\n${desc.slice(0, 6000)}\n\nReturn ONLY valid JSON.`;
-          const ytResp = await anthropic.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 2000, messages: [{ role: 'user', content: ytPrompt }] });
+          const ytResp = await ai.messages.create({ model: 'claude-haiku-4-5-20251001', max_tokens: 2000, messages: [{ role: 'user', content: ytPrompt }] });
           const raw = ytResp.content[0].text?.trim() ?? '';
           let recipe;
           try { recipe = JSON.parse(raw); } catch { const m = raw.match(/\{[\s\S]+\}/); recipe = m ? JSON.parse(m[0]) : { error: 'parse' }; }
@@ -351,7 +485,7 @@ app.post('/api/import/url', async (req, res) => {
       || html.match(/content="([^"]+)"\s+property="og:image"/i);
     const metaImage = imgMatch ? imgMatch[1] : null;
 
-    const response = await anthropic.messages.create({
+    const response = await ai.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 2000,
       messages: [
@@ -391,7 +525,7 @@ app.post('/api/import/scan', async (req, res) => {
   if (!base64Image) return res.status(400).json({ error: 'base64Image is required' });
 
   try {
-    const response = await anthropic.messages.create({
+    const response = await ai.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 2000,
       messages: [
@@ -438,7 +572,7 @@ app.post('/api/ai/fridge', async (req, res) => {
   const { ingredients } = req.body;
   if (!ingredients) return res.status(400).json({ error: 'ingredients is required' });
   try {
-    const response = await anthropic.messages.create({
+    const response = await ai.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 1500,
       messages: [{
@@ -473,7 +607,7 @@ app.post('/api/ai/leftovers', async (req, res) => {
   const { meal } = req.body;
   if (!meal) return res.status(400).json({ error: 'meal is required' });
   try {
-    const response = await anthropic.messages.create({
+    const response = await ai.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 1500,
       messages: [{
@@ -510,7 +644,7 @@ app.post('/api/ai/chat', async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'message is required' });
   try {
-    const response = await anthropic.messages.create({
+    const response = await ai.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 800,
       system: 'You are an expert chef and cooking assistant. Answer cooking questions helpfully and concisely. Focus on practical advice.',
@@ -528,7 +662,7 @@ app.post('/api/ai/healthify', async (req, res) => {
   const { ingredients, title } = req.body;
   if (!ingredients) return res.status(400).json({ error: 'ingredients is required' });
   try {
-    const response = await anthropic.messages.create({
+    const response = await ai.messages.create({
       model: 'claude-haiku-4-5-20251001',
       max_tokens: 800,
       messages: [{

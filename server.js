@@ -11,8 +11,25 @@ const app = express();
 // rate limiting keys on the real client IP (not Render's shared proxy IP).
 app.set('trust proxy', 1);
 
-app.use(cors());
+// The API is only ever called by the mobile app, never by a web page, so no
+// browser origin needs access. Keeping CORS wide open let anyone embed our
+// paid AI endpoints in a site of their own.
+app.use(cors({ origin: false }));
 app.use(express.json({ limit: '20mb' }));
+
+// ── App identity gate ─────────────────────────────────────────
+// The AI + import routes cost real money per call. They stay open to signed-out
+// users (the 3 free Smart Chef tries are a core feature, so we cannot require a
+// login), but they must not be callable by anyone who simply discovers the
+// server URL. The app sends a shared secret; requests without it are refused.
+// If APP_SECRET is unset the gate stays open, so an incomplete deploy can never
+// take the live app down.
+const APP_SECRET = process.env.APP_SECRET;
+function requireAppSecret(req, res, next) {
+  if (!APP_SECRET) return next();
+  if (req.get('x-app-key') === APP_SECRET) return next();
+  return res.status(401).json({ error: 'Unauthorized.' });
+}
 
 // ── Per-request language context ──────────────────────────────
 // The app sends the user's chosen language in the X-App-Language header. We
@@ -170,7 +187,7 @@ app.use('/api/import/', aiLimiter);      // stricter: URL + scan extraction (als
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 // Extract recipe from URL (web or social)
-app.post('/api/import/url', async (req, res) => {
+app.post('/api/import/url', requireAppSecret, async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
 
@@ -520,7 +537,7 @@ app.post('/api/import/url', async (req, res) => {
 });
 
 // Extract recipe from camera scan image (base64)
-app.post('/api/import/scan', async (req, res) => {
+app.post('/api/import/scan', requireAppSecret, async (req, res) => {
   const { base64Image } = req.body;
   if (!base64Image) return res.status(400).json({ error: 'base64Image is required' });
 
@@ -568,7 +585,7 @@ app.post('/api/import/scan', async (req, res) => {
 });
 
 // AI Tool 1: What's in my fridge?
-app.post('/api/ai/fridge', async (req, res) => {
+app.post('/api/ai/fridge', requireAppSecret, async (req, res) => {
   const { ingredients } = req.body;
   if (!ingredients) return res.status(400).json({ error: 'ingredients is required' });
   try {
@@ -603,7 +620,7 @@ Be creative but practical. Return ONLY valid JSON. No markdown fences.`,
 });
 
 // AI Tool 2: Transform Leftovers
-app.post('/api/ai/leftovers', async (req, res) => {
+app.post('/api/ai/leftovers', requireAppSecret, async (req, res) => {
   const { meal } = req.body;
   if (!meal) return res.status(400).json({ error: 'meal is required' });
   try {
@@ -640,7 +657,7 @@ Return ONLY valid JSON. No markdown fences.`,
 });
 
 // AI Tool 3: Chef S.O.S Chat
-app.post('/api/ai/chat', async (req, res) => {
+app.post('/api/ai/chat', requireAppSecret, async (req, res) => {
   const { message } = req.body;
   if (!message) return res.status(400).json({ error: 'message is required' });
   try {
@@ -658,7 +675,7 @@ app.post('/api/ai/chat', async (req, res) => {
 });
 
 // AI Tool 4: Make it Healthier
-app.post('/api/ai/healthify', async (req, res) => {
+app.post('/api/ai/healthify', requireAppSecret, async (req, res) => {
   const { ingredients, title } = req.body;
   if (!ingredients) return res.status(400).json({ error: 'ingredients is required' });
   try {

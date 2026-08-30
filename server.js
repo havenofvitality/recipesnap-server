@@ -279,18 +279,37 @@ app.post('/api/import/url', requireAppSecret, async (req, res) => {
       if (!match) return res.status(422).json({ error: 'Invalid Instagram URL. Copy the link directly from the post.' });
       const code = match[1];
       try {
-        const embedRes = await fetch(`https://www.instagram.com/p/${code}/embed/captioned/`, {
-          headers: BROWSER_HEADERS,
-          signal: AbortSignal.timeout(12000),
-        });
-        const embedHtml = await embedRes.text();
-        const embedText = embedHtml
-          .replace(/<script[\s\S]*?<\/script>/gi, '')
-          .replace(/<style[\s\S]*?<\/style>/gi, '')
-          .replace(/<[^>]+>/g, ' ')
-          .replace(/\s+/g, ' ').trim().slice(0, 8000);
+        // Instagram serves reels and posts under different embed paths, and it
+        // increasingly answers datacenter IPs with a login wall instead of the
+        // caption. Try every known embed shape before giving up, and keep the
+        // longest usable body — one of them usually still carries the caption.
+        const embedUrls = [
+          `https://www.instagram.com/reel/${code}/embed/captioned/`,
+          `https://www.instagram.com/p/${code}/embed/captioned/`,
+          `https://www.instagram.com/reel/${code}/embed/`,
+          `https://www.instagram.com/p/${code}/embed/`,
+        ];
+        let embedText = '';
+        for (const embedUrl of embedUrls) {
+          try {
+            const embedRes = await fetch(embedUrl, {
+              headers: BROWSER_HEADERS,
+              signal: AbortSignal.timeout(12000),
+            });
+            if (!embedRes.ok) continue;
+            const embedHtml = await embedRes.text();
+            const text = embedHtml
+              .replace(/<script[\s\S]*?<\/script>/gi, '')
+              .replace(/<style[\s\S]*?<\/style>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\s+/g, ' ').trim().slice(0, 8000);
+            if (text.length > embedText.length) embedText = text;
+            // A caption-bearing page is comfortably longer than the login wall.
+            if (embedText.length >= 400) break;
+          } catch { /* try the next shape */ }
+        }
         if (embedText.length < 100) {
-          return res.status(422).json({ error: 'Could not read this Instagram post. Make sure the account is public.' });
+          return res.status(422).json({ error: 'Instagram blocked this request. Instagram often prevents apps from reading its posts. Try copying the caption text and using it directly, or import from TikTok, YouTube, Pinterest or a recipe website instead.' });
         }
         const igResp = await ai.messages.create({
           model: 'claude-haiku-4-5-20251001', max_tokens: 2000,

@@ -309,7 +309,10 @@ app.post('/api/import/url', requireAppSecret, async (req, res) => {
           } catch { /* try the next shape */ }
         }
         if (embedText.length < 100) {
-          return res.status(422).json({ error: 'Instagram blocked this request. Instagram often prevents apps from reading its posts. Try copying the caption text and using it directly, or import from TikTok, YouTube, Pinterest or a recipe website instead.' });
+          // Instagram blocks datacenter IPs, so link import fails for most
+          // posts however many embed shapes we try. Point the user at the
+          // camera scan instead — screenshotting the caption always works.
+          return res.status(422).json({ error: 'Instagram blocks apps from reading its posts. Here is what works: screenshot the post with its caption visible, then use Scan Recipe on that screenshot — it extracts the recipe perfectly.' });
         }
         const igResp = await ai.messages.create({
           model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
@@ -320,7 +323,7 @@ app.post('/api/import/url', requireAppSecret, async (req, res) => {
         if (recipe.error) return res.status(422).json({ error: recipe.error });
         return res.json(recipe);
       } catch {
-        return res.status(422).json({ error: 'Could not read this Instagram post. Make sure the post is public.' });
+        return res.status(422).json({ error: 'Instagram blocks apps from reading its posts. Here is what works: screenshot the post with its caption visible, then use Scan Recipe on that screenshot — it extracts the recipe perfectly.' });
       }
     }
 
@@ -578,7 +581,15 @@ app.post('/api/import/scan', requireAppSecret, async (req, res) => {
             },
             {
               type: 'text',
-              text: `Extract the recipe visible in this image. Return a JSON object with exactly these fields:\n{\n  "title": string,\n  "servings": number (default 2 if not found),\n  "time": string or null (e.g. "30 min"),\n  "ingredients": [{ "qty": string, "name": string }],\n  "instructions": [string]\n}\n\nIf no recipe is visible, return: {"error": "No recipe found in image"}\n\nReturn ONLY valid JSON. No markdown fences.`,
+              // Two very different jobs share this one endpoint:
+              // CASE A — the image contains written recipe text (handwritten
+              // card, cookbook page, a screenshot of a caption): transcribe it
+              // faithfully, invent nothing.
+              // CASE B — the image is just a photo of a finished dish with no
+              // text: identify the dish and write a plausible recipe for it.
+              // Case B must be flagged, because it is an approximation of the
+              // dish, NOT the original recipe, and the user has to know that.
+              text: `Look at this image and return a recipe as JSON.\n\nFIRST decide which case applies:\n\nCASE A — The image contains WRITTEN RECIPE TEXT (a handwritten card, a cookbook or magazine page, a screenshot of a post caption, a printed recipe).\n→ Transcribe that recipe exactly as written. Do not invent or embellish anything. Keep the original quantities and steps.\n→ Set "generated" to false.\n\nCASE B — The image shows only a PREPARED DISH or FOOD, with no readable recipe text.\n→ Identify the dish as precisely as you can from what you see, then write a realistic, practical recipe a home cook could follow to reproduce it. Use standard technique and sensible quantities for that dish.\n→ Set "generated" to true.\n→ Prefix the title with "Inspired by: " (for example "Inspired by: Glazed Meatloaf").\n\nReturn a JSON object with exactly these fields:\n{\n  "title": string,\n  "servings": number (default 4 if unknown),\n  "time": string or null (e.g. "45 min"),\n  "ingredients": [{ "qty": string, "name": string }],\n  "instructions": [string],\n  "generated": boolean\n}\n\nOnly return {"error": "No food or recipe found in image"} when the image contains neither readable recipe text NOR any identifiable food. Never return an error just because a dish photo has no written recipe — that is CASE B, so write the recipe.\n\nReturn ONLY valid JSON. No markdown fences.`,
             },
           ],
         },
